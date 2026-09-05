@@ -16,7 +16,7 @@ from pydantic import BaseModel
 BASE = os.path.dirname(os.path.abspath(__file__))
 HF_INDEX_BASE = os.environ.get(
     "ICMR_HF_INDEX_BASE",
-    "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main",
+    "https://huggingface.co/datasets/ig-magic/icrm-hitek-full-db-mixed/resolve/main",
 ).rstrip("/")
 INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
@@ -195,7 +195,8 @@ def root():
         "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "developer": "@kzr0x | channel @api_wallah",   # <-- credit added
+        "api" : "https://vishal-info.vercel.app/search?q=9800000000"
+        "developer": "vishal | channel vishal",   # <-- credit added
     }
 
 
@@ -363,7 +364,7 @@ def build_ui():
 - `GET /health` — Health check
 - `GET /docs` — Swagger UI
 
-**Source:** [HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
+**Source:** [HF Dataset](https://huggingface.co/datasets/ig-magic/icrm-hitek-full-db-mixed)
             """)
 
         # Developer credit footer
