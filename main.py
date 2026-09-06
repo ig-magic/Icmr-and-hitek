@@ -195,8 +195,8 @@ def root():
         "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "api" : "https://vishal-info.vercel.app/search?q=9800000000"
-        "developer": "vishal | channel vishal",   # <-- credit added
+        "api" : "https://vishal-info.vercel.app/search?q=9800000000",
+        "developer": "@vishal | channel vishal",   # <-- credit added
     }
 
 
