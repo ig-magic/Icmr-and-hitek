@@ -16,7 +16,7 @@ from pydantic import BaseModel
 BASE = os.path.dirname(os.path.abspath(__file__))
 HF_INDEX_BASE = os.environ.get(
     "ICMR_HF_INDEX_BASE",
-    "https://huggingface.co/datasets/ig-magic/icmr-sorted-index",
+    "https://huggingface.co/api/datasets/ig-magic/icmr-sorted-index/parquet/default/train",
 ).rstrip("/")
 INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
