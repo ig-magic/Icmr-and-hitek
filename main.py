@@ -1,384 +1,507 @@
-import asyncio
-import glob
-import json
+
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+import logging
+from contextlib import asynccontextmanager
 
-import duckdb
-import gradio as gr
-import httpx  # <-- added for pinger
-from fastapi import FastAPI, HTTPException, Query, Response
-from pydantic import BaseModel
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 
-# ── Config ──────────────────────────────────────────────────────────────────
-BASE = os.path.dirname(os.path.abspath(__file__))
-HF_INDEX_BASE = os.environ.get(
-    "ICMR_HF_INDEX_BASE",
-    "https://huggingface.co/api/datasets/ig-magic/icmr-sorted-index/parquet/default/train",
-).rstrip("/")
-INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
-THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
-DUPLICATE_CAP = 2
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
 
-SEARCH_FIELDS = [
-    "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
-    "address", "district", "pincode", "state", "town", "source",
-]
-NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("hf-dataset-api")
 
-IDX_PHONE = "idx_phone"
-IDX_AADHAR = "idx_aadhar"
+HF_DATASET = os.getenv("HF_DATASET", "").strip()
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
-REMOTE_INDEXES = {
-    "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
-    "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
-}
-
-# ── DuckDB Connection Pool ──────────────────────────────────────────────────
-_conns: list[duckdb.DuckDBPyConnection] = []
-_conns_lock = threading.Lock()
-_thread_local = threading.local()
-pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
+HF_API = "https://datasets-server.huggingface.co"
+TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 
 
-def _idx_ready(kind: str) -> bool:
-    return kind in REMOTE_INDEXES
+def get_headers():
+    headers = {"User-Agent": "HF-Dataset-Explorer/1.0"}
+
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+    return headers
 
 
-def _new_conn() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
-    # Vercel fix: set home & extension dir to /tmp
-    con.execute("SET home_directory='/tmp'")
-    con.execute("SET extension_directory='/tmp/duckdb_extensions'")
-    con.execute("INSTALL parquet; LOAD parquet;")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    # Create sorted index views from remote HF parts
-    for kind, urls in REMOTE_INDEXES.items():
-        view = f"people_{kind}"
-        lst = ", ".join(f"'{u}'" for u in urls)
-        con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
-    con.execute(f"SET threads = {THREADS_PER_CONN}")
-    return con
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.client = httpx.AsyncClient(
+        timeout=TIMEOUT,
+        headers=get_headers(),
+        follow_redirects=True,
+    )
+    yield
+    await app.state.client.aclose()
 
 
-def _thread_id() -> int:
-    tid = getattr(_thread_local, "id", None)
-    if tid is None:
-        with _conns_lock:
-            tid = len(_conns)
-            _thread_local.id = tid
-    return tid
+app = FastAPI(
+    title="Hugging Face Dataset API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
-def _get_conn() -> duckdb.DuckDBPyConnection:
-    ident = _thread_id()
-    with _conns_lock:
-        while len(_conns) <= ident:
-            _conns.append(_new_conn())
-    return _conns[ident]
+# --------------------------------------------------
+# Hugging Face request helper
+# --------------------------------------------------
+
+async def hf_get(endpoint: str, params: dict):
+    if not HF_DATASET:
+        raise HTTPException(
+            status_code=503,
+            detail="Set the HF_DATASET environment variable.",
+        )
+
+    try:
+        response = await app.state.client.get(
+            f"{HF_API}/{endpoint.lstrip('/')}",
+            params={"dataset": HF_DATASET, **params},
+        )
+
+        if response.status_code >= 400:
+            logger.error(
+                "Hugging Face returned HTTP %s for %s",
+                response.status_code,
+                endpoint,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Hugging Face API returned HTTP "
+                    f"{response.status_code}."
+                ),
+            )
+
+        data = response.json()
+
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="Unexpected response from Hugging Face.",
+            )
+
+        if data.get("error"):
+            logger.warning(
+                "Hugging Face API reported a dataset error: %s",
+                data["error"],
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Hugging Face could not serve this dataset.",
+            )
+
+        return data
+
+    except HTTPException:
+        raise
+
+    except httpx.TimeoutException:
+        logger.exception("Hugging Face request timed out")
+        raise HTTPException(
+            status_code=504,
+            detail="Hugging Face request timed out. Try again.",
+        )
+
+    except httpx.RequestError:
+        logger.exception("Hugging Face network request failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not connect to Hugging Face.",
+        )
+
+    except ValueError:
+        logger.exception("Invalid JSON from Hugging Face")
+        raise HTTPException(
+            status_code=502,
+            detail="Hugging Face returned invalid JSON.",
+        )
+
+    except Exception:
+        logger.exception("Unexpected dataset API error")
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected internal error.",
+        )
 
 
-# ── Dedup & Connected Records ───────────────────────────────────────────────
-def _person_key(row: dict) -> tuple:
-    ph = (row.get("phoneNumber") or "").strip()
-    ad = (row.get("aadharNumber") or "").strip()
-    if ph or ad:
-        return (ph, ad)
-    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
+# --------------------------------------------------
+# Endpoints
+# --------------------------------------------------
 
-
-def _connected_numbers(row: dict) -> list[dict]:
-    connected, seen = [], set()
-    for field in NUMBER_FIELDS:
-        raw = row.get(field)
-        if raw is None:
-            continue
-        value = str(raw).strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        connected.append({"field": field, "value": value})
-    return connected
-
-
-def _cap_duplicates(rows: list[dict]) -> list[dict]:
-    seen: dict[tuple, int] = {}
-    out = []
-    for r in rows:
-        k = _person_key(r)
-        n = seen.get(k, 0)
-        if n < DUPLICATE_CAP:
-            seen[k] = n + 1
-            record = dict(r)
-            record["connected_numbers"] = _connected_numbers(record)
-            out.append(record)
-    return out
-
-
-# ── Search Logic ────────────────────────────────────────────────────────────
-def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
-    if field not in SEARCH_FIELDS:
-        raise ValueError(f"Unknown field: {field}")
-    v = value.replace("'", "''")
-
-    if mode == "exact":
-        if field == "phoneNumber" and _idx_ready("phone"):
-            view = "people_phone"
-        elif field == "aadharNumber" and _idx_ready("aadhar"):
-            view = "people_aadhar"
-        elif field == "otherNumber":
-            # otherNumber not sorted — skip to avoid slow scan
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
-    elif mode == "contains":
-        if field == "name":
-            # Name search not available in remote-only mode
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        v2 = v.replace("%", r"\%").replace("_", r"\_")
-        sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    con = _get_conn()
-    rows = con.execute(sql).fetchall()
-    cols = [d[0] for d in con.description]
-    results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
-    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
-
-
-def _unified_search(q: str, limit: int = 10) -> dict:
-    q = q.strip()
-    is_num = q.isdigit() and len(q) >= 8
-
-    if is_num:
-        all_rows = []
-        searched = []
-        # Phone index first (fast)
-        if _idx_ready("phone"):
-            r = _run_field_search("phoneNumber", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("phoneNumber")
-        # Aadhar index second
-        if not all_rows and _idx_ready("aadhar"):
-            r = _run_field_search("aadharNumber", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("aadharNumber")
-        all_rows = _cap_duplicates(all_rows)[:limit]
-        return {
-            "query": q, "searched_fields": searched,
-            "count": len(all_rows), "results": all_rows,
-        }
-    else:
-        return {"query": q, "searched_fields": [], "count": 0, "results": []}
-
-
-# ── FastAPI (for API access) ────────────────────────────────────────────────
-fastapi_app = FastAPI(title="ICMR + HITEK Search API")
-
-
-class BatchRequest(BaseModel):
-    queries: list[dict[str, Any]]
-    limit: int = 10
-
-
-@fastapi_app.get("/")
-def root():
+@app.get("/health")
+async def health():
     return {
-        "app": "ICMR + HITEK Search API",
-        "records": 2_504_793_870,
-        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-        "index_source": INDEX_SOURCE,
-        "columns": SEARCH_FIELDS,
-        "docs": "/docs",
-        "api" : "https://vishal-info.vercel.app/search?q=9800000000",
-        "developer": "@vishal | channel vishal",   # <-- credit added
+        "status": "ok",
+        "dataset_configured": bool(HF_DATASET),
+        "provider": "Hugging Face Dataset Viewer API",
     }
 
 
-@fastapi_app.get("/health")
-def health():
-    return {"status": "ok", "raw_database_required": False,
-            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-            "index_source": INDEX_SOURCE}
+@app.get("/api/dataset")
+async def dataset_info():
+    result = await hf_get("splits", {})
+
+    splits = result.get("splits", [])
+
+    return {
+        "success": True,
+        "dataset": HF_DATASET,
+        "split_count": len(splits),
+        "splits": splits,
+    }
 
 
-@fastapi_app.get("/search")
-async def search(
-    q: str | None = Query(None),
-    mobile: str | None = Query(None),
-    field: str | None = Query(None),
-    mode: str = Query("exact"),
-    limit: int = Query(10, ge=1, le=1000),
-    pretty: bool = Query(True),
+@app.get("/api/rows")
+async def dataset_rows(
+    config: str = Query(default="default", min_length=1, max_length=200),
+    split: str = Query(default="train", min_length=1, max_length=100),
+    offset: int = Query(default=0, ge=0),
+    length: int = Query(default=20, ge=1, le=100),
 ):
-    q_val = (q or mobile or "").strip()
-    if not q_val:
-        raise HTTPException(422, "Provide q or mobile")
-    loop = asyncio.get_running_loop()
-    if field:
-        data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
-    else:
-        data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
-    result = {"success": bool(data["count"]), **data, "number": q_val,
-              "total": data["count"]}
-    content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
-    return Response(content=content, media_type="application/json")
+    # Verify the selected config and split before requesting rows.
+    metadata = await hf_get("splits", {})
 
+    available = metadata.get("splits", [])
 
-@fastapi_app.post("/search/parallel")
-async def search_parallel(req: BatchRequest):
-    if not req.queries:
-        raise HTTPException(400, "queries must not be empty")
-    if len(req.queries) > 50:
-        raise HTTPException(400, "max 50 queries per batch")
-    loop = asyncio.get_running_loop()
-    tasks = [
-        loop.run_in_executor(pool, _run_field_search,
-                             item.get("field", "phoneNumber"),
-                             item.get("value", ""),
-                             item.get("mode", "exact"),
-                             int(item.get("limit", req.limit)))
-        for item in req.queries
-    ]
-    results = await asyncio.gather(*tasks)
-    return Response(content=json.dumps({"searches": len(req.queries), "results": list(results)},
-                                       indent=2, ensure_ascii=False),
-                    media_type="application/json")
+    valid = any(
+        item.get("config") == config
+        and item.get("split") == split
+        for item in available
+    )
 
-
-# ── Pinger (keeps app alive) ──────────────────────────────────────────────
-async def pinger():
-    """Ping the /health endpoint every 2 minutes to prevent idle shutdown."""
-    port = os.getenv("PORT", "7860")  # default Gradio port; change if needed
-    url = f"http://localhost:{port}/health"
-    async with httpx.AsyncClient(timeout=10) as client:
-        while True:
-            await asyncio.sleep(120)  # 2 minutes
-            try:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    print(f"[Pinger] OK at {asyncio.get_event_loop().time()}")
-                else:
-                    print(f"[Pinger] Unexpected status: {resp.status_code}")
-            except Exception as e:
-                print(f"[Pinger] Error: {e}")
-
-
-@fastapi_app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(pinger())
-
-
-# ── Gradio UI ───────────────────────────────────────────────────────────────
-def format_result(row: dict) -> str:
-    """Format a single result record as readable text."""
-    lines = []
-    for field in SEARCH_FIELDS:
-        val = row.get(field, "")
-        if val:
-            lines.append(f"**{field}:** {val}")
-    # Connected numbers
-    cn = row.get("connected_numbers", [])
-    if cn:
-        nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
-        lines.append(f"**connected:** {nums}")
-    return "\n\n".join(lines)
-
-
-def search_ui(query: str, limit: int) -> str:
-    """Main Gradio search function."""
-    if not query or not query.strip():
-        return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
-
-    q = query.strip()
-    try:
-        data = _unified_search(q, int(limit))
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-    count = data["count"]
-    results = data["results"]
-    searched = ", ".join(data.get("searched_fields", []))
-
-    if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found** for this number."
-
-    header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
-    parts = []
-    for i, row in enumerate(results, 1):
-        parts.append(f"### Result {i}\n{format_result(row)}")
-    return header + "\n\n---\n\n".join(parts)
-
-
-def build_ui():
-    with gr.Blocks(
-        title="ICMR Search API",
-        theme=gr.themes.Soft(),
-        css="""
-        .main-title { text-align: center; margin-bottom: 0; }
-        .subtitle { text-align: center; color: #666; margin-top: 0; }
-        .footer { text-align: center; color: #888; margin-top: 20px; }
-        """
-    ) as demo:
-        gr.Markdown("# 🔍 ICMR + HITEK Search API", elem_classes="main-title")
-        gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name, address & more", elem_classes="subtitle")
-
-        with gr.Row():
-            with gr.Column(scale=3):
-                query_input = gr.Textbox(
-                    label="Search Query",
-                    placeholder="Phone number, Aadhaar, ya name daalo...",
-                    lines=1,
-                )
-            with gr.Column(scale=1):
-                limit_slider = gr.Slider(
-                    minimum=1, maximum=50, value=10, step=1,
-                    label="Max Results",
-                )
-
-        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
-        output = gr.Markdown(label="Results")
-
-        search_btn.click(
-            fn=search_ui,
-            inputs=[query_input, limit_slider],
-            outputs=output,
-        )
-        query_input.submit(
-            fn=search_ui,
-            inputs=[query_input, limit_slider],
-            outputs=output,
+    if not valid:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid config or split. Check /api/dataset.",
         )
 
-        gr.Markdown("---")
-        with gr.Accordion("📡 API Info", open=False):
-            gr.Markdown("""
-**Endpoints** (via FastAPI):
-- `GET /search?q=<number>` — Phone/Aadhaar search
-- `GET /search?mobile=<number>` — Phone search (alias)
-- `GET /health` — Health check
-- `GET /docs` — Swagger UI
+    result = await hf_get(
+        "rows",
+        {
+            "config": config,
+            "split": split,
+            "offset": offset,
+            "length": length,
+        },
+    )
 
-**Source:** [HF Dataset](https://huggingface.co/datasets/ig-magic/icrm-hitek-full-db-mixed)
-            """)
+    return {
+        "success": True,
+        "dataset": HF_DATASET,
+        "config": config,
+        "split": split,
+        "offset": offset,
+        "length": length,
+        "total": result.get("num_rows_total"),
+        "features": result.get("features", []),
+        "rows": result.get("rows", []),
+    }
 
-        # Developer credit footer
-        gr.Markdown(
-            "---\n"
-            "<div class='footer'>"
-            "👨‍💻 **Developer:** @vishal  |  📢 **Channel:** @vishal"
-            "</div>",
-            elem_classes="footer"
+
+@app.get("/api/search")
+async def search_dataset(
+    q: str = Query(min_length=1, max_length=200),
+    config: str = Query(default="default"),
+    split: str = Query(default="train"),
+):
+    metadata = await hf_get("splits", {})
+
+    valid = any(
+        item.get("config") == config
+        and item.get("split") == split
+        for item in metadata.get("splits", [])
+    )
+
+    if not valid:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid config or split.",
         )
 
-    return demo
+    return await hf_get(
+        "search",
+        {
+            "config": config,
+            "split": split,
+            "query": q,
+        },
+    )
 
 
-# ── Mount Gradio on FastAPI ─────────────────────────────────────────────────
-demo = build_ui()
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+# --------------------------------------------------
+# Simple browser UI
+# --------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HF Dataset Explorer</title>
+<style>
+body {
+  font: 16px Arial, sans-serif;
+  margin: 24px auto;
+  padding: 0 16px;
+  max-width: 1000px;
+  background: #f5f6fa;
+  color: #202536;
+}
+section {
+  background: white;
+  padding: 18px;
+  margin: 14px 0;
+  border-radius: 12px;
+}
+button, select, input {
+  padding: 10px;
+  margin: 5px 3px 5px 0;
+}
+button { cursor: pointer; }
+#table { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td {
+  text-align: left;
+  padding: 10px;
+  border-bottom: 1px solid #ddd;
+  overflow-wrap: anywhere;
+}
+th { background: #edf0f6; }
+</style>
+</head>
+<body>
+<h1>Hugging Face Dataset Explorer</h1>
+
+<section>
+  <p id="status">Loading dataset metadata...</p>
+  <label>Config: <select id="config"></select></label>
+  <label>Split: <select id="split"></select></label>
+  <button id="load">Load records</button>
+</section>
+
+<section>
+  <input id="query" placeholder="Search dataset text">
+  <button id="search">Search</button>
+  <div id="table">No data loaded.</div>
+  <p>
+    <button id="prev" disabled>Previous</button>
+    <span id="page">Page 1</span>
+    <button id="next" disabled>Next</button>
+  </p>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+let offset = 0;
+const length = 20;
+let total = null;
+let splits = [];
+
+async function api(path) {
+  const response = await fetch(path);
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.detail || "Request failed");
+  }
+
+  return data;
+}
+
+function selectedSplit() {
+  return JSON.parse($("split").value);
+}
+
+function displayRows(rows) {
+  if (!rows.length) {
+    $("table").textContent = "No records found.";
+    return;
+  }
+
+  const columns = Object.keys(rows[0].row || {});
+  const table = document.createElement("table");
+  const head = document.createElement("tr");
+
+  for (const col of columns) {
+    const th = document.createElement("th");
+    th.textContent = col;
+    head.appendChild(th);
+  }
+
+  const thead = document.createElement("thead");
+  thead.appendChild(head);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+
+  for (const item of rows) {
+    const tr = document.createElement("tr");
+
+    for (const col of columns) {
+      const td = document.createElement("td");
+      const value = item.row[col];
+
+      td.textContent =
+        value === null || value === undefined
+          ? ""
+          : typeof value === "object"
+            ? JSON.stringify(value)
+            : String(value);
+
+      tr.appendChild(td);
+    }
+
+    tbody.appendChild(tr);
+  }
+
+  table.appendChild(tbody);
+  $("table").replaceChildren(table);
+}
+
+async function loadRows() {
+  $("status").textContent = "Loading records...";
+  $("next").disabled = true;
+  $("prev").disabled = true;
+
+  try {
+    const s = selectedSplit();
+    const params = new URLSearchParams({
+      config: s.config,
+      split: s.split,
+      offset: String(offset),
+      length: String(length)
+    });
+
+    const data = await api("/api/rows?" + params);
+
+    displayRows(data.rows || []);
+    total = data.total ?? null;
+
+    $("status").textContent =
+      "Loaded " + (data.rows || []).length + " records.";
+
+    $("page").textContent =
+      "Page " + (Math.floor(offset / length) + 1) +
+      (total !== null ? " · Total: " + total : "");
+
+    $("prev").disabled = offset === 0;
+    $("next").disabled =
+      total !== null && offset + length >= total;
+
+  } catch (e) {
+    $("status").textContent = "Error: " + e.message;
+    $("table").textContent = "Could not load records.";
+  }
+}
+
+async function searchRows() {
+  const q = $("query").value.trim();
+
+  if (!q) {
+    $("status").textContent = "Enter a search term.";
+    return;
+  }
+
+  try {
+    const s = selectedSplit();
+    const params = new URLSearchParams({
+      q,
+      config: s.config,
+      split: s.split
+    });
+
+    const data = await api("/api/search?" + params);
+    displayRows(data.rows || []);
+    $("status").textContent = "Search completed.";
+  } catch (e) {
+    $("status").textContent = "Search error: " + e.message;
+  }
+}
+
+async function init() {
+  try {
+    const data = await api("/api/dataset");
+    splits = data.splits || [];
+
+    if (!splits.length) {
+      throw new Error("No available dataset splits.");
+    }
+
+    const configs = [...new Set(splits.map(x => x.config))];
+    $("config").replaceChildren();
+
+    for (const config of configs) {
+      const opt = document.createElement("option");
+      opt.value = config;
+      opt.textContent = config;
+      $("config").appendChild(opt);
+    }
+
+    function updateSplits() {
+      const config = $("config").value;
+      const matches = splits.filter(x => x.config === config);
+
+      $("split").replaceChildren();
+
+      for (const item of matches) {
+        const opt = document.createElement("option");
+        opt.value = JSON.stringify(item);
+        opt.textContent = item.split;
+        $("split").appendChild(opt);
+      }
+
+      offset = 0;
+    }
+
+    $("config").addEventListener("change", () => {
+      updateSplits();
+      loadRows();
+    });
+
+    $("split").addEventListener("change", () => {
+      offset = 0;
+      loadRows();
+    });
+
+    updateSplits();
+    await loadRows();
+
+  } catch (e) {
+    $("status").textContent = "Dataset error: " + e.message;
+  }
+}
+
+$("load").onclick = () => loadRows();
+$("search").onclick = () => searchRows();
+
+$("prev").onclick = () => {
+  offset = Math.max(0, offset - length);
+  loadRows();
+};
+
+$("next").onclick = () => {
+  if (total === null || offset + length < total) {
+    offset += length;
+    loadRows();
+  }
+};
+
+init();
+</script>
+</body>
+</html>
+""")
+
+
+# Vercel Python runtime entry point
+# Export the FastAPI application as `app`.
