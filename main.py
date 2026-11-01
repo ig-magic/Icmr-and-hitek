@@ -55,7 +55,7 @@ logger = logging.getLogger("hf-explorer")
 HF_DATASET = os.getenv("HF_DATASET", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 ALLOW_OVERRIDE = os.getenv("ALLOW_DATASET_OVERRIDE", "0").strip() == "1"
-API_KEY = os.getenv("DEMO_API_KEY", "").strip()
+API_KEY = os.getenv("DEMO_API_KEY", "arya").strip()
 
 HF_API = "https://datasets-server.huggingface.co"
 TIMEOUT = httpx.Timeout(20.0, connect=8.0)
