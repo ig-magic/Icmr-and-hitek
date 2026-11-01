@@ -106,7 +106,12 @@ TIMEOUT = httpx.Timeout(30.0, connect=8.0)
 PAGE_SIZE = _env_int("PAGE_SIZE", 20, 1, HF_MAX_LIMIT)
 MAX_PAGE_SIZE = _env_int("MAX_PAGE_SIZE", 100, 1, HF_MAX_LIMIT)
 CACHE_TTL = _env_int("CACHE_TTL", 120, 0, 86400)
-SCAN_MAX_ROWS = _env_int("SCAN_MAX_ROWS", 20000, 100, 500000)
+SCAN_MAX_ROWS = _env_int("SCAN_MAX_ROWS", 3000, 100, 500000)
+# Vercel par function 10s (Hobby) me band ho jata hai -> budget ke andar raho
+REQUEST_BUDGET = float(_env("REQUEST_BUDGET", "7.5") or 7.5)
+HF_CALL_TIMEOUT = float(_env("HF_CALL_TIMEOUT", "6") or 6)
+SEARCH_CACHE_TTL = _env_int("SEARCH_CACHE_TTL", 300, 0, 86400)
+CLIENT_MAX_RETRIES = _env_int("CLIENT_MAX_RETRIES", 3, 0, 10)
 
 BOT_TOKEN = _env("BOT_TOKEN") or _env("TELEGRAM_BOT_TOKEN")
 BOT_CHAT_ID = _env("BOT_CHAT_ID") or _env("TELEGRAM_CHAT_ID")
@@ -119,11 +124,36 @@ BOT_ENABLED = bool(BOT_TOKEN and BOT_CHAT_ID)
 # ------------------------------------------------------------- allowed keys --
 
 def parse_keys(raw: str) -> list:
-    """comma / semicolon / newline / space separated; quotes aur spaces hata deta hai."""
-    items = re.split(r"[,;\n\r\t ]+", raw or "")
+    """
+    ALLOWED_KEYS ko jitne bhi shakal me daala ho, sab chalta hai:
+      arya,key2            -> 2 keys
+      ["arya", "key2"]     -> 2 keys   (JSON list / python list style)
+      'arya' ; key2        -> 2 keys
+      arya key2            -> 2 keys
+      "arya",              -> 1 key
+    Brackets, quotes, spaces, newlines sab strip ho jate hain.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+
+    # JSON array ho to seedha parse
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                items = []
+                for item in data:
+                    items.extend(parse_keys(str(item)))
+                return items
+        except Exception:
+            text = text.strip("[]")
+
+    text = text.strip("[](){}")
+    items = re.split(r"[,;\n\r\t ]+", text)
     cleaned = []
     for item in items:
-        item = item.strip().strip("'\"").strip()
+        item = item.strip().strip("'\"").strip().rstrip(",").strip()
         if item:
             cleaned.append(item)
     return cleaned
@@ -137,10 +167,13 @@ ALLOWED_KEY_SET = {k.casefold() for k in ALLOWED_KEYS if k not in ("*", "all", "
 
 
 def mask_key(key: str, keep: int = 2) -> str:
+    """arya -> ar*a · 14ec092a -> 14****2a · a -> *"""
     if not key:
         return "****"
+    if len(key) <= 2:
+        return "*" * max(2, len(key))
     if len(key) <= keep * 2:
-        return "****"
+        return f"{key[0]}{'*' * max(1, len(key) - 2)}{key[-1]}"
     return f"{key[:keep]}{'*' * min(8, len(key) - keep * 2)}{key[-keep:]}"
 
 
@@ -271,7 +304,7 @@ app.add_middleware(
 
 # ------------------------------------------------------------- HF transport --
 
-async def hf_get(endpoint: str, params: dict) -> dict:
+async def hf_get(endpoint: str, params: dict, call_timeout: Optional[float] = None) -> dict:
     if not HF_DATASET:
         raise HTTPException(status_code=503, detail="Set the HF_DATASET environment variable.")
 
@@ -279,6 +312,10 @@ async def hf_get(endpoint: str, params: dict) -> dict:
         response = await app.state.client.get(
             f"{HF_API}/{endpoint.lstrip('/')}",
             params={"dataset": HF_DATASET, **params},
+            timeout=httpx.Timeout(
+                call_timeout or HF_CALL_TIMEOUT,
+                connect=min(6.0, (call_timeout or HF_CALL_TIMEOUT)),
+            ),
         )
     except httpx.TimeoutException:
         logger.exception("HF timeout (%s)", endpoint)
@@ -339,7 +376,8 @@ async def resolve_split(config: str, split: str) -> dict:
     )
 
 
-async def fetch_rows(config: str, split: str, offset: int, length: int) -> dict:
+async def fetch_rows(config: str, split: str, offset: int, length: int,
+                     call_timeout: Optional[float] = None) -> dict:
     return await hf_get(
         "rows",
         {
@@ -348,6 +386,7 @@ async def fetch_rows(config: str, split: str, offset: int, length: int) -> dict:
             "offset": max(0, offset),
             "length": max(1, min(HF_MAX_LIMIT, length)),
         },
+        call_timeout=call_timeout,
     )
 
 
@@ -356,7 +395,7 @@ async def get_schema(config: str, split: str) -> list:
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
-    data = await fetch_rows(config, split, 0, 1)
+    data = await fetch_rows(config, split, 0, 1, call_timeout=min(HF_CALL_TIMEOUT, 4.0))
     features = data.get("features", []) or []
     cache_set(cache_key, features)
     cache_set(f"total::{config}::{split}", int(data.get("num_rows_total") or 0))
@@ -413,6 +452,7 @@ async def hf_filter(config: str, split: str, where: str, offset: int, length: in
             "offset": offset,
             "length": max(1, min(HF_MAX_LIMIT, length)),
         },
+        call_timeout=HF_CALL_TIMEOUT,
     )
 
 
@@ -426,53 +466,25 @@ async def hf_search(config: str, split: str, query: str, offset: int, length: in
             "offset": offset,
             "length": max(1, min(HF_MAX_LIMIT, length)),
         },
+        call_timeout=HF_CALL_TIMEOUT,
     )
 
 
-async def scan_all_rows(config: str, split: str) -> dict:
-    cache_key = f"scan::{config}::{split}"
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached
+SEARCH_LOCKS: dict[str, asyncio.Lock] = {}
 
-    first = await fetch_rows(config, split, 0, HF_MAX_LIMIT)
-    features = first.get("features", []) or []
-    total = int(first.get("num_rows_total") or 0)
-    limit = min(total or SCAN_MAX_ROWS, SCAN_MAX_ROWS)
-    records = normalise_records(first.get("rows", []), 0)
 
-    semaphore = asyncio.Semaphore(6)
-
-    async def grab(offset: int) -> list:
-        async with semaphore:
-            try:
-                data = await fetch_rows(config, split, offset, HF_MAX_LIMIT)
-                return normalise_records(data.get("rows", []), offset)
-            except HTTPException:
-                return []
-
-    offsets = list(range(HF_MAX_LIMIT, limit, HF_MAX_LIMIT))
-    for i in range(0, len(offsets), 10):
-        for batch in await asyncio.gather(*[grab(o) for o in offsets[i:i + 10]]):
-            records.extend(batch)
-
-    records.sort(key=lambda r: r.get("_index", 0))
-    payload = {"features": features, "records": records, "total": total}
-    cache_set(cache_key, payload)
-    return payload
+def match_record(record: dict, query: str) -> bool:
+    needle = query.casefold()
+    for field, value in record.items():
+        if field == "_index":
+            continue
+        if needle in to_text(value).casefold():
+            return True
+    return False
 
 
 def filter_locally(records: list, query: str) -> list:
-    needle = query.casefold()
-    hits = []
-    for record in records:
-        for field, value in record.items():
-            if field == "_index":
-                continue
-            if needle in to_text(value).casefold():
-                hits.append(record)
-                break
-    return hits
+    return [record for record in records if match_record(record, query)]
 
 
 def field_hits(records: list, query: str) -> dict:
@@ -488,30 +500,113 @@ def field_hits(records: list, query: str) -> dict:
     return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
+async def scan_matches(config: str, split: str, query: str, deadline: float) -> dict:
+    """
+    Dataset ko chunks me padh ke locally filter karta hai — lekin DEADLINE ke andar.
+    Jo mil gaya wahi return; aborted=True matlab time khatam ho gaya.
+    Result cache hota hai (SEARCH_CACHE_TTL) taaki dobara wahi query fast chale.
+    """
+    cache_key = f"searchcache::{config}::{split}::{query.casefold()}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return {"records": cached, "scanned": len(cached), "complete": True, "source": "cache"}
+
+    total_rows = int(cache_get(f"total::{config}::{split}") or 0)
+    cap = min(total_rows or SCAN_MAX_ROWS, SCAN_MAX_ROWS)
+
+    results: list = []
+    scanned = 0
+    complete = True
+    semaphore = asyncio.Semaphore(6)
+    offsets = list(range(0, cap, HF_MAX_LIMIT))
+
+    async def grab(offset: int, call_timeout: float) -> list:
+        async with semaphore:
+            try:
+                data = await fetch_rows(config, split, offset, HF_MAX_LIMIT,
+                                        call_timeout=call_timeout)
+                return normalise_records(data.get("rows", []), offset)
+            except HTTPException:
+                return []
+            except Exception:
+                return []
+
+    for i in range(0, len(offsets), 10):
+        left = deadline - time.monotonic()
+        if left <= 0.4:
+            complete = False
+            break
+        batch = offsets[i:i + 10]
+        call_timeout = max(1.0, min(HF_CALL_TIMEOUT, left))
+        rowsets = await asyncio.gather(*[grab(o, call_timeout) for o in batch])
+        for rows in rowsets:
+            scanned += len(rows)
+            if len(rows) < HF_MAX_LIMIT:
+                complete = True  # end of dataset
+            for record in rows:
+                if match_record(record, query):
+                    results.append(record)
+        if any(len(rows) == 0 for rows in rowsets):
+            complete = False
+
+    results.sort(key=lambda r: r.get("_index", 0))
+    if complete and results:
+        cache_set(cache_key, results)
+    return {"records": results, "scanned": scanned, "complete": complete, "source": "scan"}
+
+
 async def run_search(config: str, split: str, query: str, offset: int, length: int) -> dict:
     """
-    engine order: hf-filter -> local-scan -> hf-search
-    Returns: records / total / features / engine / took_ms
+    HARD deadline wrapper: chahe HF kitna slow ho, response REQUEST_BUDGET ke andar
+    hi aayega (Vercel ka 10s kill hone se pehle) — warna JSON 504 milega.
     """
-    started = time.perf_counter()
+    try:
+        return await asyncio.wait_for(
+            _run_search_inner(config, split, query, offset, length),
+            timeout=REQUEST_BUDGET,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Search timeout ({REQUEST_BUDGET:.0f}s budget). Dataset bada hai — "
+                "query chhota/specific karo, ya SCAN_MAX_ROWS kam karo, "
+                "ya HF_TOKEN ke saath private/faster dataset use karo."
+            ),
+        )
+
+
+async def _run_search_inner(config: str, split: str, query: str, offset: int, length: int) -> dict:
+    """
+    engine order: hf-filter -> local-scan (deadline ke andar) -> hf-search
+    """
+    started = time.monotonic()
+    deadline = started + REQUEST_BUDGET
+
     features: list = []
     total_rows = 0
+    notes: list = []
     try:
-        meta = await fetch_rows(config, split, 0, 1)
+        meta = await fetch_rows(config, split, 0, 1, call_timeout=min(HF_CALL_TIMEOUT, 4.0))
         features = meta.get("features", []) or []
         total_rows = int(meta.get("num_rows_total") or 0)
-    except HTTPException:
-        features = features or []
+    except HTTPException as exc:
+        notes.append(f"schema: {exc.detail}")
 
-    def done(records, total, feats, engine):
+    def done(records, total, feats, engine, *, scanned=0, complete=True):
         return {
             "records": records,
             "total": int(total or 0),
             "features": feats or features,
             "engine": engine,
-            "took_ms": int((time.perf_counter() - started) * 1000),
+            "took_ms": int((time.monotonic() - started) * 1000),
+            "scanned": scanned,
+            "complete": complete,
+            "partial": not complete,
+            "notes": notes[:3],
         }
 
+    # ---- 1) HF /filter (fast server side) --------------------------------
     where = build_where(features, query)
     if where:
         try:
@@ -519,27 +614,51 @@ async def run_search(config: str, split: str, query: str, offset: int, length: i
             records = normalise_records(data.get("rows", []))
             total = data.get("num_rows_total")
             return done(records, total if total is not None else len(records),
-                        data.get("features"), "hf-filter")
+                        data.get("features"), "hf-filter",
+                        scanned=total or len(records), complete=True)
         except HTTPException as exc:
+            notes.append(f"filter: {exc.detail}")
             logger.info("filter unavailable (%s) -> next", exc.detail)
 
-    if total_rows and total_rows <= SCAN_MAX_ROWS:
+    # ---- 2) local scan (chhote dataset, deadline ke andar) ---------------
+    if total_rows and total_rows <= SCAN_MAX_ROWS and time.monotonic() < deadline:
         try:
-            scan = await scan_all_rows(config, split)
-            hits = filter_locally(scan["records"], query)
-            return done(hits[offset:offset + length], len(hits), scan["features"], "local-scan")
+            scan = await scan_matches(config, split, query, deadline)
+            if scan["records"] or scan["complete"]:
+                return done(scan["records"][offset:offset + length], len(scan["records"]),
+                            features, "local-scan",
+                            scanned=scan["scanned"], complete=scan["complete"])
+            notes.append("scan: kuch nahi mila / time kam pada")
         except HTTPException as exc:
+            notes.append(f"scan: {exc.detail}")
             logger.info("local scan failed (%s) -> /search", exc.detail)
 
+    # ---- 3) HF full-text search -----------------------------------------
+    left = deadline - time.monotonic()
+    if left <= 0.4:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Search timeout — dataset bada hai. Chhota/specific query try karo "
+                "ya SCAN_MAX_ROWS / HF_TOKEN (private+fast) check karo."
+            ),
+        )
     try:
         data = await hf_search(config, split, query, offset, length)
         records = normalise_records(data.get("rows", []))
         total = data.get("num_rows_total")
         return done(records, total if total is not None else len(records),
-                    data.get("features"), "hf-search")
+                    data.get("features"), "hf-search",
+                    scanned=total or len(records), complete=True)
     except HTTPException as exc:
-        logger.info("search failed (%s)", exc.detail)
-        raise HTTPException(status_code=502, detail="Search backend busy. Please retry.")
+        notes.append(f"search: {exc.detail}")
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Search backend busy/timeout. 2-3 second baad retry karo. "
+                f"Details: {'; '.join(notes)[:200]}"
+            ),
+        )
 
 
 # ------------------------------------------------------- device / location --
@@ -751,27 +870,36 @@ async def fetch_data(
     use_split = resolved.get("split", use_split)
 
     query = (query or "").strip()
-    features = await get_schema(use_config, use_split)
+    features = cache_get(f"schema::{use_config}::{use_split}") or []
+    extra: dict = {}
 
     if query:
         result = await run_search(use_config, use_split, query, offset, limit)
         records, total = result["records"], result["total"]
         features = result["features"] or features
         engine, took_ms = result["engine"], result["took_ms"]
+        extra = {
+            "scanned": result.get("scanned", 0),
+            "complete": result.get("complete", True),
+            "partial": result.get("partial", False),
+            "notes": result.get("notes", []),
+        }
     else:
         data = await fetch_rows(use_config, use_split, offset, limit)
         records = normalise_records(data.get("rows", []), offset)
         total = int(data.get("num_rows_total") or 0)
         features = data.get("features", []) or features
         engine, took_ms = "hf-rows", 0
+        cache_set(f"schema::{use_config}::{use_split}", features)
+        cache_set(f"total::{use_config}::{use_split}", total)
 
     if notify_flag:
         ip = client_ip(request)
         geo = vercel_location(request)
         if geo.get("city") or geo.get("country"):
-            extra = await lookup_location(ip)
-            if extra.get("org"):
-                geo["org"] = extra["org"]
+            geo_extra = await lookup_location(ip)
+            if geo_extra.get("org"):
+                geo["org"] = geo_extra["org"]
         else:
             geo = await lookup_location(ip)
         await notify(
@@ -783,6 +911,7 @@ async def fetch_data(
         "key": key,
         "query": query,
         "records": records,
+        **extra,
         "total": total,
         "offset": offset,
         "limit": limit,
@@ -974,6 +1103,10 @@ async def path_search(
             "engine": data["engine"],
             "fields_searched": [c["name"] for c in data["schema"]],
             "took_ms": data["took_ms"],
+            "scanned": data.get("scanned", 0),
+            "complete": data.get("complete", True),
+            "partial": data.get("partial", False),
+            "notes": data.get("notes", []),
             "field_hits_on_page": field_hits(data["records"], data["query"]),
         },
         "pagination": paging_block(data),
@@ -1060,6 +1193,9 @@ async def api_search(
         },
         "engine": data["engine"],
         "took_ms": data["took_ms"],
+        "scanned": data.get("scanned", 0),
+        "complete": data.get("complete", True),
+        "partial": data.get("partial", False),
         "field_hits": field_hits(data["records"], data["query"]),
         "items": data["records"],
     }, compact=(format == "compact"))
@@ -1176,6 +1312,7 @@ DSL_HTML = r"""
  .err{background:#2a1420;border:1px solid #5a2233;color:#ffb3c1;border-radius:12px;
    padding:14px;margin:12px 0;font-size:13px;white-space:pre-wrap;word-break:break-word}
  .empty{text-align:center;color:var(--mut);padding:40px 10px}
+ @keyframes sp{to{transform:rotate(360deg)}}
  #top{position:fixed;right:16px;bottom:16px;border-radius:50%;width:44px;height:44px;
    padding:0;display:none;font-size:16px}
 </style>
@@ -1191,6 +1328,9 @@ DSL_HTML = r"""
     <select id="limit"><option value="20">20 / page</option><option value="50">50 / page</option>
       <option value="100" selected>100 / page</option></select>
     <button id="go">Search</button>
+    <button id="retry" class="ghost" style="display:none">Retry</button>
+    <span id="spin" style="display:none;width:14px;height:14px;border-radius:50%;
+      border:2px solid #2b6ef6;border-top-color:transparent;animation:sp .7s linear infinite"></span>
     <a class="btn ghost" id="rawlink" href="#" target="_blank">Raw JSON</a>
     <a class="btn ghost" id="prevlink" href="/">Docs</a>
   </div>
@@ -1203,23 +1343,28 @@ DSL_HTML = r"""
 
 <script>
 const $ = id => document.getElementById(id);
-const S = { key:"", query:"", limit:100, offset:0, total:0, loaded:0, engine:"", done:false, busy:false, pages:0 };
+const S = {
+  key:"", query:"", limit:100, offset:0, total:0, loaded:0,
+  engine:"", done:true, busy:false, pages:0,
+  fails:0, resultSig:null, errThrottle:0, api:false
+};
 
-/* ---- route detect: "/key" ya "/key/query" ya "/api/v1/..." ---- */
-function parseRoute() {
+function parseRoute(){
   const parts = location.pathname.split("/").filter(Boolean);
   let api = false;
-  if (parts[0] === "api" && parts[1] === "v1") { api = true; parts.splice(0, 2); }
-  return { api, key: parts[0] ? decodeURIComponent(parts[0]) : "", query: parts[1] ? decodeURIComponent(parts[1]) : "" };
+  if (parts[0] === "api" && parts[1] === "v1"){ api = true; parts.splice(0,2); }
+  return { api,
+    key: parts[0] ? decodeURIComponent(parts[0]) : "",
+    query: parts[1] ? decodeURIComponent(parts[1]) : "" };
 }
 
-function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+const esc = s => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 
 function hl(json){
   return esc(json).replace(/("[^"\n]*")(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?/g,
     (m,str,colon,lit)=>{
-      if(str) return `<span class="${colon?"k":"s"}">${str}</span>${colon||""}`;
-      if(lit) return `<span class="b">${m}</span>`;
+      if (str) return `<span class="${colon?"k":"s"}">${str}</span>${colon||""}`;
+      if (lit) return `<span class="b">${m}</span>`;
       return `<span class="n">${m}</span>`;
     });
 }
@@ -1232,85 +1377,130 @@ function recordCard(rec){
     <pre>${hl(JSON.stringify(copy,null,2))}</pre></div>`;
 }
 
+function busy(on){ S.busy = on; $("spin").style.display = on ? "inline-block" : "none"; }
+
+function stopAll(msg){
+  S.done = true;
+  $("loading").textContent = msg || "";
+  busy(false);
+}
+
+function errBox(msg){
+  // ek hi error card, max 2 second me ek baar (loop se bachne ke liye)
+  const now = Date.now();
+  if (now - S.errThrottle < 2000) return;
+  S.errThrottle = now;
+  const old = document.querySelectorAll(".err");
+  old.forEach((el, i) => { if (i < old.length - 1) el.remove(); });
+  $("out").insertAdjacentHTML("afterbegin", `<div class="err">${esc(msg)}</div>`);
+}
+
 async function fetchPage(){
-  const p = S.pages + 1;
-  let url;
-  if (S.api) {
-    url = `/api/v1/${encodeURIComponent(S.key)}` + (S.query ? `/${encodeURIComponent(S.query)}` : "")
-        + `?format=json&cursor=${S.offset}&limit=${S.limit}`;
-  } else {
-    url = `/${encodeURIComponent(S.key)}` + (S.query ? `/${encodeURIComponent(S.query)}` : "")
-        + `?format=json&page=${p}&limit=${S.limit}`;
+  const page = S.pages + 1;
+  const base = S.api ? "/api/v1/" : "/";
+  const url = base + encodeURIComponent(S.key) + (S.query ? "/" + encodeURIComponent(S.query) : "")
+    + (S.api ? `?format=json&cursor=${S.offset}&limit=${S.limit}`
+             : `?format=json&page=${page}&limit=${S.limit}`);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  let res, text;
+  try {
+    res = await fetch(url, { headers: { "Accept": "application/json" }, signal: controller.signal });
+    text = await res.text();
+  } catch (e) {
+    clearTimeout(timer);
+    throw new Error(controller.signal.aborted
+      ? "Request timeout (20s). Search chhota karo ya retry button dabao."
+      : "Network error: " + e.message);
   }
-  const res = await fetch(url, { headers: { "Accept": "application/json" } });
-  const text = await res.text();
+  clearTimeout(timer);
+
   let data;
-  try { data = JSON.parse(text); } catch(e){ throw new Error("Bad JSON: " + text.slice(0,200)); }
+  try { data = JSON.parse(text); }
+  catch (e) { throw new Error("Server ne JSON nahi diya (HTTP " + res.status + "): " + text.slice(0, 160)); }
+
   if (!res.ok || data.success === false || data.ok === false) {
-    throw new Error(data.error || ("HTTP " + res.status));
+    throw new Error((data.error || ("HTTP " + res.status)) + "\n\n(Retry karne ke liye niche ‘Retry’ dabao — page automatically loop nahi karega.)");
   }
   return data;
 }
 
 function normalize(data){
+  const pg = data.pagination || {}, cur = data.cursor || {};
   const items = data.items || data.results || [];
-  const pg = data.pagination || {};
-  const cur = data.cursor || {};
   return {
     items,
     total: pg.total ?? cur.total ?? data.total_matches ?? data.total ?? 0,
     has_more: pg.has_more ?? cur.has_more ?? false,
     engine: data.engine || (data.search && data.search.engine) || "-",
     endpoint: data.endpoint || "",
-    query: data.query || (data.search && data.search.query) || ""
+    partial: data.partial ?? (data.search && data.search.partial) ?? false
   };
 }
 
-async function loadMore(){
-  if (S.busy || S.done) return;
-  S.busy = true;
-  $("loading").textContent = "Loading page " + (S.pages + 1) + "…";
-  try {
-    const raw = await fetchPage();
-    const page = normalize(raw);
-    S.total = page.total; S.engine = page.engine; S.endpoint = page.endpoint;
-    S.offset += S.limit; S.pages += 1; S.loaded += page.items.length;
-    S.done = !page.has_more || page.items.length === 0;
-
-    if (S.pages === 1) {
-      $("out").innerHTML = page.items.length ? "" :
-        `<div class="empty">Kuch nahi mila${S.query?` for “${esc(S.query)}”`:""}.</div>`;
-    }
-    $("out").insertAdjacentHTML("beforeend", page.items.map(recordCard).join(""));
-    paint(page);
-    $("loading").textContent = S.done ? (S.loaded ? "— end of data —" : "") : "";
-  } catch (err) {
-    S.done = true;
-    $("loading").textContent = "";
-    $("out").insertAdjacentHTML("afterbegin", `<div class="err">${esc(err.message)}</div>`);
-  } finally { S.busy = false; }
-}
-
 function paint(page){
-  $("ttl").textContent = `${S.query ? "search: " + S.query : "browse"} · dataset`;
+  $("ttl").textContent = S.query ? "search: " + S.query : "browse";
   $("pills").innerHTML =
     `<span class="pill">key <b>${esc(S.key)}</b></span>` +
     `<span class="pill">endpoint <b>${esc(S.endpoint)}</b></span>` +
     `<span class="pill">engine <b>${esc(S.engine)}</b></span>` +
     `<span class="pill">loaded <b>${S.loaded}</b> / ${S.total}</span>` +
-    (S.query ? `<span class="pill">query <b>${esc(S.query)}</b></span>` : "");
+    (S.query ? `<span class="pill">query <b>${esc(S.query)}</b></span>` : "") +
+    (page && page.partial ? `<span class="pill">partial scan</span>` : "");
   const base = S.api ? `/api/v1/${encodeURIComponent(S.key)}` : `/${encodeURIComponent(S.key)}`;
   $("rawlink").href = base + (S.query ? `/${encodeURIComponent(S.query)}` : "") + "?format=json&limit=" + S.limit;
 }
 
+async function loadMore(){
+  if (S.busy || S.done) return;
+  busy(true);
+  $("loading").textContent = "Loading " + (S.query ? "results" : "page " + (S.pages + 1)) + "…";
+  try {
+    const page = normalize(await fetchPage());
+
+    // ---- guard: same page dobara nahi (loop se bachne ke liye) ----
+    const sig = (page.items[0] && page.items[0]._index) + ":" + page.items.length + ":" + page.total;
+    if (S.resultSig !== null && sig === S.resultSig) { stopAll("— end of data —"); return; }
+    S.resultSig = sig;
+
+    S.total = page.total; S.engine = page.engine; S.endpoint = page.endpoint;
+    S.offset += S.limit; S.pages += 1; S.loaded += page.items.length;
+    S.fails = 0;
+    S.done = !page.has_more || page.items.length === 0;
+
+    if (S.pages === 1 && page.items.length === 0) {
+      $("out").innerHTML = `<div class="empty">Kuch nahi mila${S.query?` for “${esc(S.query)}”`:""}.</div>`;
+    }
+    $("out").insertAdjacentHTML("beforeend", page.items.map(recordCard).join(""));
+    paint(page);
+    $("loading").textContent = S.done ? (S.loaded ? "— end of data —" : "") : "";
+    $("retry").style.display = "none";
+  } catch (err) {
+    S.fails += 1;
+    errBox(err.message);
+    if (S.fails >= 2) {
+      stopAll("Ruk gaya (error). ‘Retry’ dabao.");
+      $("retry").style.display = "inline-block";
+    } else {
+      // sirf ek baar, thodi der baad
+      $("loading").textContent = "Error — ek baar phir koshish…";
+      setTimeout(() => { if (!S.done) loadMore(); }, 1500);
+    }
+  } finally {
+    busy(false);
+  }
+}
+
 function reset(key, query){
   S.key = key; S.query = query; S.limit = parseInt($("limit").value,10);
-  S.offset = 0; S.pages = 0; S.loaded = 0; S.total = 0; S.done = false; S.busy = false;
+  S.offset = 0; S.pages = 0; S.loaded = 0; S.total = 0;
+  S.done = false; S.busy = false; S.fails = 0; S.resultSig = null; S.errThrottle = 0;
   $("out").innerHTML = ""; $("loading").textContent = "";
+  $("retry").style.display = "none";
   loadMore();
 }
 
-/* ---- events ---- */
 $("go").onclick = () => {
   const q = $("q").value.trim();
   const base = (S.api ? "/api/v1/" : "/") + encodeURIComponent(S.key);
@@ -1319,21 +1509,28 @@ $("go").onclick = () => {
 };
 $("q").addEventListener("keydown", e => { if (e.key === "Enter") $("go").click(); });
 $("limit").onchange = () => reset(S.key, S.query);
-$("top").onclick = () => window.scrollTo({ top: 0, behavior: "smooth" });
+$("retry").onclick = () => {
+  S.fails = 0; S.resultSig = null; S.done = false;
+  document.querySelectorAll(".err").forEach(el => el.remove());
+  loadMore();
+};
+$("top").onclick = () => window.scrollTo({ top:0, behavior:"smooth" });
 window.addEventListener("scroll", () => { $("top").style.display = scrollY > 600 ? "block" : "none"; });
 
+// ---- infinite scroll: sirf tab jab busy nahi + done nahi + error nahi ----
+let ioLock = false;
 new IntersectionObserver(entries => {
-  if (entries[0].isIntersecting && !S.done) loadMore();
-}, { rootMargin: "600px 0px" }).observe($("sentinel"));
+  if (!entries[0].isIntersecting || ioLock) return;
+  if (S.busy || S.done || S.fails >= 2) return;
+  ioLock = true;
+  loadMore().finally(() => setTimeout(() => { ioLock = false; }, 400));
+}, { rootMargin: "500px 0px" }).observe($("sentinel"));
 
-/* ---- boot ---- */
 const route = parseRoute();
-if (!route.key) {
-  location.replace("/");
-} else {
+if (!route.key) { location.replace("/"); }
+else {
+  S.api = route.api;
   $("q").value = route.query;
-  $("ttl").textContent = route.query ? "search: " + route.query : "browse";
-  $("prevlink").href = "/";
   reset(route.key, route.query);
 }
 </script>
